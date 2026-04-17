@@ -1,0 +1,10 @@
+# fastapi==0.115.8
+# uvicorn==0.34.0
+# sentence-transformers==3.4.1
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+pydantic==2.10.6
+sentence-transformers==3.4.1
+torch==2.10.0+cu126
