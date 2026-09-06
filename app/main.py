@@ -18,6 +18,14 @@ TRUSTED_SERVICE_TOKENS_RAW = os.getenv("TRUSTED_SERVICE_TOKENS", "{}")
 INTERNAL_AUTH_HEADER_NAME = os.getenv("INTERNAL_AUTH_HEADER_NAME", "X-Service-Token")
 INTERNAL_SERVICE_NAME_HEADER = os.getenv("INTERNAL_SERVICE_NAME_HEADER", "X-Service-Name")
 
+# Лимиты запроса. Сервис — единственный источник эмбеддингов на всю систему: его падение
+# останавливает и индексацию, и поиск, поэтому один большой запрос не должен иметь
+# возможности исчерпать память. Потребители обязаны резать данные на батчи
+# (см. EMBED_BATCH_SIZE в ingest-worker).
+MAX_TEXTS_PER_REQUEST = int(os.getenv("MAX_TEXTS_PER_REQUEST", "256"))
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "20000"))
+MAX_TOTAL_CHARS = int(os.getenv("MAX_TOTAL_CHARS", "1000000"))
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 logger.info("Loading model: %s", MODEL_NAME)
@@ -26,11 +34,33 @@ model = SentenceTransformer(MODEL_NAME, device=DEVICE)
 logger.info("Model loaded")
 
 
-def trusted_tokens() -> dict[str, str]:
+def _parse_trusted_tokens() -> dict[str, str]:
+    """Разбор TRUSTED_SERVICE_TOKENS один раз при запуске.
+
+    Раньше JSON парсился на каждый запрос, а ошибка разбора молча превращалась в пустой
+    словарь — то есть опечатка в переменной окружения приводила к 403 на все вызовы без
+    единого указания на настоящую причину. Теперь некорректный JSON роняет сервис на старте.
+    """
     try:
-        return json.loads(TRUSTED_SERVICE_TOKENS_RAW)
-    except Exception:
-        return {}
+        parsed = json.loads(TRUSTED_SERVICE_TOKENS_RAW or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Некорректный JSON в TRUSTED_SERVICE_TOKENS: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("TRUSTED_SERVICE_TOKENS должен быть JSON-объектом {имя: токен}")
+    return parsed
+
+
+TRUSTED_TOKENS = _parse_trusted_tokens()
+
+if INTERNAL_AUTH_ENABLED and not TRUSTED_TOKENS:
+    logger.warning(
+        "TRUSTED_SERVICE_TOKENS пуст при включённой аутентификации — /embed будет отвечать "
+        "403 на любой запрос."
+    )
+
+
+def trusted_tokens() -> dict[str, str]:
+    return TRUSTED_TOKENS
 
 
 def verify_internal_request(
@@ -50,6 +80,34 @@ def verify_internal_request(
 class EmbedRequest(BaseModel):
     texts: list[str] = Field(default_factory=list)
     normalize: bool = True
+
+
+def _check_request_size(texts: list[str]) -> None:
+    """Отклоняет заведомо неподъёмные запросы до того, как они дойдут до модели."""
+    if len(texts) > MAX_TEXTS_PER_REQUEST:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"Слишком много текстов в одном запросе: {len(texts)} > {MAX_TEXTS_PER_REQUEST}. "
+                f"Разбейте на батчи."
+            ),
+        )
+
+    total = 0
+    for index, text in enumerate(texts):
+        length = len(text)
+        if length > MAX_TEXT_CHARS:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Текст #{index} длиной {length} символов превышает лимит {MAX_TEXT_CHARS}.",
+            )
+        total += length
+
+    if total > MAX_TOTAL_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Суммарная длина текстов {total} превышает лимит {MAX_TOTAL_CHARS}.",
+        )
 
 
 class EmbedResponse(BaseModel):
@@ -73,6 +131,24 @@ def ping():
     }
 
 
+# Размер батча при кодировании. Без явного значения sentence-transformers берёт 32 текста
+# разом; у bge-m3 окно 8192 токена, поэтому пик активаций на таком батче огромен. На стенде
+# это выражалось так: после индексации 676 чанков процесс держал 10 ГБ из 12 ГБ видеопамяти,
+# ollama не смогла разместить модель и уехала целиком в CPU (0 из 33 слоёв на GPU).
+ENCODE_BATCH_SIZE = int(os.getenv("ENCODE_BATCH_SIZE", "8"))
+
+# Возвращать ли освобождённую видеопамять драйверу после запроса. Кэширующий аллокатор
+# PyTorch по умолчанию держит освобождённые блоки у себя — это быстрее, но на одной карте
+# с ollama означает, что пик потребления навсегда остаётся занятым. Стоит несколько
+# миллисекунд на запрос и заметно меньше, чем само кодирование.
+RELEASE_GPU_CACHE = os.getenv("RELEASE_GPU_CACHE", "true").lower() == "true"
+
+
+def _release_gpu_cache() -> None:
+    if RELEASE_GPU_CACHE and DEVICE == "cuda":
+        torch.cuda.empty_cache()
+
+
 @app.post("/embed", response_model=EmbedResponse)
 def embed(
     req: EmbedRequest,
@@ -80,14 +156,18 @@ def embed(
     x_service_token: str = Header(..., alias=INTERNAL_AUTH_HEADER_NAME),
 ):
     verify_internal_request(x_service_name, x_service_token)
+    _check_request_size(req.texts)
 
     vectors = model.encode(
         req.texts,
+        batch_size=ENCODE_BATCH_SIZE,
         normalize_embeddings=req.normalize,
         show_progress_bar=False,
     )
 
     result = [v.tolist() for v in vectors]
+
+    _release_gpu_cache()
     dim = len(result[0]) if result else model.get_sentence_embedding_dimension()
 
     return EmbedResponse(
