@@ -1,3 +1,4 @@
+import hmac
 import json
 import logging
 import os
@@ -17,6 +18,11 @@ INTERNAL_AUTH_ENABLED = os.getenv("INTERNAL_AUTH_ENABLED", "true").lower() == "t
 TRUSTED_SERVICE_TOKENS_RAW = os.getenv("TRUSTED_SERVICE_TOKENS", "{}")
 INTERNAL_AUTH_HEADER_NAME = os.getenv("INTERNAL_AUTH_HEADER_NAME", "X-Service-Token")
 INTERNAL_SERVICE_NAME_HEADER = os.getenv("INTERNAL_SERVICE_NAME_HEADER", "X-Service-Name")
+
+# Заглушки из .env.example и слишком короткие значения не годятся в качестве токена:
+# это единственное, что защищает внутренние API.
+WEAK_TOKEN_MARKERS = ("super-secret-token", "change-me", "change_me", "changeme")
+MIN_TOKEN_LENGTH = 24
 
 # Лимиты запроса. Сервис — единственный источник эмбеддингов на всю систему: его падение
 # останавливает и индексацию, и поиск, поэтому один большой запрос не должен иметь
@@ -47,6 +53,19 @@ def _parse_trusted_tokens() -> dict[str, str]:
         raise RuntimeError(f"Некорректный JSON в TRUSTED_SERVICE_TOKENS: {exc}") from exc
     if not isinstance(parsed, dict):
         raise RuntimeError("TRUSTED_SERVICE_TOKENS должен быть JSON-объектом {имя: токен}")
+    if INTERNAL_AUTH_ENABLED:
+        weak = [
+            name
+            for name, token in parsed.items()
+            if len(str(token)) < MIN_TOKEN_LENGTH
+            or any(marker in str(token).lower() for marker in WEAK_TOKEN_MARKERS)
+        ]
+        if weak:
+            raise RuntimeError(
+                f"Слабые токены в TRUSTED_SERVICE_TOKENS для: {', '.join(weak)}. "
+                f"Нужны случайные значения длиной не менее {MIN_TOKEN_LENGTH} символов "
+                "(scripts/gen_service_tokens.py в корне репозитория main)."
+            )
     return parsed
 
 
@@ -70,7 +89,7 @@ def verify_internal_request(
     if not INTERNAL_AUTH_ENABLED:
         return
     expected = trusted_tokens().get(x_service_name)
-    if not expected or expected != x_service_token:
+    if not expected or not hmac.compare_digest(expected.encode(), x_service_token.encode()):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid internal token",
