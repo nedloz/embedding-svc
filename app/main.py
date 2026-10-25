@@ -2,6 +2,9 @@ import hmac
 import json
 import logging
 import os
+import threading
+import time
+from contextlib import asynccontextmanager
 
 import torch
 from fastapi import FastAPI, Header, HTTPException, status
@@ -34,10 +37,46 @@ MAX_TOTAL_CHARS = int(os.getenv("MAX_TOTAL_CHARS", "1000000"))
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-logger.info("Loading model: %s", MODEL_NAME)
-logger.info("Using device: %s", DEVICE)
-model = SentenceTransformer(MODEL_NAME, device=DEVICE)
-logger.info("Model loaded")
+# Пауза между попытками загрузки модели: начинается с MODEL_LOAD_RETRY_WAIT_SEC и
+# удваивается до MODEL_LOAD_RETRY_MAX_WAIT_SEC.
+MODEL_LOAD_RETRY_WAIT_SEC = float(os.getenv("MODEL_LOAD_RETRY_WAIT_SEC", "5"))
+MODEL_LOAD_RETRY_MAX_WAIT_SEC = float(os.getenv("MODEL_LOAD_RETRY_MAX_WAIT_SEC", "300"))
+
+# Модель грузится в фоновом потоке после старта процесса, а не при импорте модуля.
+# Раньше неудачная загрузка (нет сети к HF, нет места, недоступен GPU) роняла импорт, и
+# контейнер уходил в цикл перезапусков, а пока модель грузилась, сервис не отвечал вообще.
+# Теперь процесс жив сразу: /health отвечает всегда, /ping и /embed — 503 до загрузки.
+_model: SentenceTransformer | None = None
+_load_attempts = 0
+_load_error: str | None = None
+
+
+def _load_model_forever() -> None:
+    global _model, _load_attempts, _load_error
+    wait = MODEL_LOAD_RETRY_WAIT_SEC
+    logger.info("Using device: %s", DEVICE)
+    while _model is None:
+        _load_attempts += 1
+        logger.info("Loading model: %s (attempt %d)", MODEL_NAME, _load_attempts)
+        try:
+            _model = SentenceTransformer(MODEL_NAME, device=DEVICE)
+        except Exception as exc:
+            _load_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("Model load failed, retrying in %g s", wait)
+            time.sleep(wait)
+            wait = min(wait * 2, MODEL_LOAD_RETRY_MAX_WAIT_SEC)
+    _load_error = None
+    logger.info("Model loaded")
+
+
+def _require_model() -> SentenceTransformer:
+    """Загруженная модель или 503 с причиной — для readiness и рабочих эндпоинтов."""
+    if _model is None:
+        detail = f"Модель {MODEL_NAME} ещё загружается (попытка {_load_attempts})"
+        if _load_error:
+            detail += f"; последняя ошибка: {_load_error}"
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail)
+    return _model
 
 
 def _parse_trusted_tokens() -> dict[str, str]:
@@ -135,11 +174,32 @@ class EmbedResponse(BaseModel):
     embeddings: list[list[float]]
 
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # Поток, а не asyncio-задача: загрузка блокирующая и не должна занимать event loop,
+    # иначе /health перестанет отвечать на время загрузки.
+    threading.Thread(target=_load_model_forever, name="model-loader", daemon=True).start()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/health")
+def health():
+    """Liveness: процесс жив. Отвечает 200 и во время загрузки модели, и при её сбоях."""
+    return {
+        "status": "ready" if _model is not None else "loading",
+        "model": MODEL_NAME,
+        "attempts": _load_attempts,
+        "last_error": _load_error,
+    }
 
 
 @app.get("/ping")
 def ping():
+    """Readiness: 503, пока модель не загружена. На него опирается healthcheck в compose."""
+    model = _require_model()
     dim = model.get_sentence_embedding_dimension()
     return {
         "status": "ok",
@@ -176,6 +236,7 @@ def embed(
 ):
     verify_internal_request(x_service_name, x_service_token)
     _check_request_size(req.texts)
+    model = _require_model()
 
     vectors = model.encode(
         req.texts,
