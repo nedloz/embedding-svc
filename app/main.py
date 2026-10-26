@@ -1,5 +1,4 @@
-import hmac
-import json
+import ipaddress
 import logging
 import os
 import threading
@@ -7,7 +6,7 @@ import time
 from contextlib import asynccontextmanager
 
 import torch
-from fastapi import FastAPI, Header, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
@@ -16,16 +15,6 @@ logger = logging.getLogger("embedding-svc")
 
 MODEL_NAME = os.getenv("EMBEDDER_MODEL_NAME", "mixedbread-ai/mxbai-embed-large-v1")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "embedding-svc")
-SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")
-INTERNAL_AUTH_ENABLED = os.getenv("INTERNAL_AUTH_ENABLED", "true").lower() == "true"
-TRUSTED_SERVICE_TOKENS_RAW = os.getenv("TRUSTED_SERVICE_TOKENS", "{}")
-INTERNAL_AUTH_HEADER_NAME = os.getenv("INTERNAL_AUTH_HEADER_NAME", "X-Service-Token")
-INTERNAL_SERVICE_NAME_HEADER = os.getenv("INTERNAL_SERVICE_NAME_HEADER", "X-Service-Name")
-
-# Заглушки из .env.example и слишком короткие значения не годятся в качестве токена:
-# это единственное, что защищает внутренние API.
-WEAK_TOKEN_MARKERS = ("super-secret-token", "change-me", "change_me", "changeme")
-MIN_TOKEN_LENGTH = 24
 
 # Лимиты запроса. Сервис — единственный источник эмбеддингов на всю систему: его падение
 # останавливает и индексацию, и поиск, поэтому один большой запрос не должен иметь
@@ -79,60 +68,34 @@ def _require_model() -> SentenceTransformer:
     return _model
 
 
-def _parse_trusted_tokens() -> dict[str, str]:
-    """Разбор TRUSTED_SERVICE_TOKENS один раз при запуске.
-
-    Раньше JSON парсился на каждый запрос, а ошибка разбора молча превращалась в пустой
-    словарь — то есть опечатка в переменной окружения приводила к 403 на все вызовы без
-    единого указания на настоящую причину. Теперь некорректный JSON роняет сервис на старте.
-    """
-    try:
-        parsed = json.loads(TRUSTED_SERVICE_TOKENS_RAW or "{}")
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Некорректный JSON в TRUSTED_SERVICE_TOKENS: {exc}") from exc
-    if not isinstance(parsed, dict):
-        raise RuntimeError("TRUSTED_SERVICE_TOKENS должен быть JSON-объектом {имя: токен}")
-    if INTERNAL_AUTH_ENABLED:
-        weak = [
-            name
-            for name, token in parsed.items()
-            if len(str(token)) < MIN_TOKEN_LENGTH
-            or any(marker in str(token).lower() for marker in WEAK_TOKEN_MARKERS)
-        ]
-        if weak:
-            raise RuntimeError(
-                f"Слабые токены в TRUSTED_SERVICE_TOKENS для: {', '.join(weak)}. "
-                f"Нужны случайные значения длиной не менее {MIN_TOKEN_LENGTH} символов "
-                "(scripts/gen_service_tokens.py в корне репозитория main)."
-            )
-    return parsed
-
-
-TRUSTED_TOKENS = _parse_trusted_tokens()
-
-if INTERNAL_AUTH_ENABLED and not TRUSTED_TOKENS:
+INTERNAL_AUTH_MODE = os.getenv("INTERNAL_AUTH_MODE", "mtls")
+CALLER_HEADER = "X-Caller-Identity"
+if INTERNAL_AUTH_MODE not in ("mtls", "insecure"):
+    raise RuntimeError(f"INTERNAL_AUTH_MODE={INTERNAL_AUTH_MODE!r}: допустимо mtls, insecure")
+if INTERNAL_AUTH_MODE == "insecure":
     logger.warning(
-        "TRUSTED_SERVICE_TOKENS пуст при включённой аутентификации — /embed будет отвечать "
-        "403 на любой запрос."
+        "INTERNAL_AUTH_MODE=insecure: /embed не аутентифицирует вызывающих. Не для стенда и продакшена."
     )
 
 
-def trusted_tokens() -> dict[str, str]:
-    return TRUSTED_TOKENS
+def _is_loopback(host: str | None) -> bool:
+    try:
+        return ipaddress.ip_address(host or "").is_loopback
+    except ValueError:
+        return False
 
 
-def verify_internal_request(
-    x_service_name: str = Header(..., alias=INTERNAL_SERVICE_NAME_HEADER),
-    x_service_token: str = Header(..., alias=INTERNAL_AUTH_HEADER_NAME),
-):
-    if not INTERNAL_AUTH_ENABLED:
-        return
-    expected = trusted_tokens().get(x_service_name)
-    if not expected or not hmac.compare_digest(expected.encode(), x_service_token.encode()):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid internal token",
-        )
+def verify_internal_request(request: Request) -> str:
+    """Статических токенов нет: вызывающего подтверждает сертификат, а имя из него проставляет
+    прокси-сайдкар в X-Caller-Identity (infra/mtls в корне main). Заголовку верим только от
+    loopback, то есть от прокси в том же сетевом пространстве."""
+    caller = request.headers.get(CALLER_HEADER) or None
+    if INTERNAL_AUTH_MODE == "insecure":
+        return caller or "unauthenticated"
+    peer = request.client.host if request.client else None
+    if not caller or not _is_loopback(peer):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Caller not verified")
+    return caller
 
 
 class EmbedRequest(BaseModel):
@@ -229,12 +192,8 @@ def _release_gpu_cache() -> None:
 
 
 @app.post("/embed", response_model=EmbedResponse)
-def embed(
-    req: EmbedRequest,
-    x_service_name: str = Header(..., alias=INTERNAL_SERVICE_NAME_HEADER),
-    x_service_token: str = Header(..., alias=INTERNAL_AUTH_HEADER_NAME),
-):
-    verify_internal_request(x_service_name, x_service_token)
+def embed(req: EmbedRequest, request: Request):
+    verify_internal_request(request)
     _check_request_size(req.texts)
     model = _require_model()
 
