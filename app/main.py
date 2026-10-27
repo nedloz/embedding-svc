@@ -4,6 +4,7 @@ import os
 import threading
 import time
 from contextlib import asynccontextmanager
+from typing import Literal
 
 import torch
 from fastapi import FastAPI, HTTPException, Request, status
@@ -15,7 +16,7 @@ from metrics import EMBED_BATCH_SIZE, EMBED_DURATION, EMBED_REQUESTS, setup_metr
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("embedding-svc")
 
-MODEL_NAME = os.getenv("EMBEDDER_MODEL_NAME", "mixedbread-ai/mxbai-embed-large-v1")
+MODEL_NAME = os.getenv("EMBEDDER_MODEL_NAME", "intfloat/multilingual-e5-base")
 SERVICE_NAME = os.getenv("SERVICE_NAME", "embedding-svc")
 
 # Лимиты запроса. Сервис — единственный источник эмбеддингов на всю систему: его падение
@@ -103,6 +104,17 @@ def verify_internal_request(request: Request) -> str:
 class EmbedRequest(BaseModel):
     texts: list[str] = Field(default_factory=list)
     normalize: bool = True
+    # Роль текста для моделей семейства e5: документ индекса или поисковый запрос.
+    kind: Literal["passage", "query"] = "passage"
+
+
+def apply_prefix(texts: list[str], kind: str, model_name: str) -> list[str]:
+    """multilingual-e5 обучена на текстах с префиксами «passage: » / «query: » и без них
+    заметно теряет в качестве. Префикс ставит сервис, чтобы правило жило в одном месте;
+    для остальных моделей (например, bge-m3) тексты возвращаются как есть."""
+    if "e5" not in model_name.lower():
+        return texts
+    return [f"{kind}: {text}" for text in texts]
 
 
 def _check_request_size(texts: list[str]) -> None:
@@ -204,7 +216,7 @@ def embed(req: EmbedRequest, request: Request):
 
     with EMBED_DURATION.time():
         vectors = model.encode(
-            req.texts,
+            apply_prefix(req.texts, req.kind, MODEL_NAME),
             batch_size=ENCODE_BATCH_SIZE,
             normalize_embeddings=req.normalize,
             show_progress_bar=False,
