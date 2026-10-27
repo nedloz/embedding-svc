@@ -174,3 +174,14 @@ loopback; запрос с другого адреса или без заголо
 чистом окружении сервис скачивает веса — это может занять заметное время; потребители в этот
 момент ждут, пока healthcheck не станет `healthy` (`start_period: 900s` в compose рассчитан на
 это скачивание). Если на медленном канале не хватает и его — увеличьте `start_period`.
+
+## Метрики
+
+`GET /metrics` отдаёт Prometheus (за mTLS - только пользователю `prometheus`, политика в `infra/mtls/embedding-svc.conf`). Кроме HTTP-метрик (`http_requests_total`, `http_request_duration_seconds`, `http_requests_inprogress`; метка `handler` - шаблон маршрута) сервис отдаёт бизнес-метрики с префиксом `pochemuchnik_`. Код: `app/metrics.py`, тесты: `tests/`. Общая картина и дашборды - `infra/observability/README.md` в корневом репозитории.
+
+| Метрика | Что считает |
+| :-- | :-- |
+| `embed_requests_total` | принятые запросы `/embed` (не отклонённые по размеру) |
+| `embed_batch_size` | число текстов в запросе |
+| `embed_duration_seconds` | время кодирования моделью |
+

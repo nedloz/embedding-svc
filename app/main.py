@@ -10,6 +10,8 @@ from fastapi import FastAPI, HTTPException, Request, status
 from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 
+from metrics import EMBED_BATCH_SIZE, EMBED_DURATION, EMBED_REQUESTS, setup_metrics
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("embedding-svc")
 
@@ -146,6 +148,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+setup_metrics(app)
 
 
 @app.get("/health")
@@ -196,13 +199,16 @@ def embed(req: EmbedRequest, request: Request):
     verify_internal_request(request)
     _check_request_size(req.texts)
     model = _require_model()
+    EMBED_REQUESTS.inc()
+    EMBED_BATCH_SIZE.observe(len(req.texts))
 
-    vectors = model.encode(
-        req.texts,
-        batch_size=ENCODE_BATCH_SIZE,
-        normalize_embeddings=req.normalize,
-        show_progress_bar=False,
-    )
+    with EMBED_DURATION.time():
+        vectors = model.encode(
+            req.texts,
+            batch_size=ENCODE_BATCH_SIZE,
+            normalize_embeddings=req.normalize,
+            show_progress_bar=False,
+        )
 
     result = [v.tolist() for v in vectors]
 
