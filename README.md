@@ -90,7 +90,7 @@ graph-rag-svc  ──┘        │
 ### `GET /ping`
 
 ```jsonc
-{ "status": "ok", "model": "...", "dimension": 1024, "device": "cuda", "cuda_available": true }
+{ "status": "ok", "model": "intfloat/multilingual-e5-base", "dimension": 768, "device": "cuda", "cuda_available": true }
 ```
 
 Readiness-проверка: `503`, пока модель не загружена, `200` с размерностью — после. На неё
@@ -101,7 +101,7 @@ Readiness-проверка: `503`, пока модель не загружена
 ### `GET /health`
 
 ```jsonc
-{ "status": "loading", "model": "BAAI/bge-m3", "attempts": 3, "last_error": "OSError: ..." }
+{ "status": "loading", "model": "intfloat/multilingual-e5-base", "attempts": 3, "last_error": "OSError: ..." }
 ```
 
 Liveness: `200`, пока процесс жив, — и во время загрузки модели, и при её сбоях. Нужен для
